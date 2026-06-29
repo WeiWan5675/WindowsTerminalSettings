@@ -7,15 +7,50 @@ param(
     [ValidateSet('Default', 'Flat', 'Mini')]
     [string] $Layout = 'Default',
     [Parameter()]
+    [ValidateSet('simple', 'intelligent')]
+    [string] $Edition = 'simple',
+    [Parameter()]
     [switch] $PreRelease
 )
+
+function Get-EditionMeta(
+    [Parameter(Mandatory=$true)]
+    [string]$Edition)
+{
+    if ($Edition -eq 'simple') {
+        return @{
+            PackagePattern      = 'Microsoft.WindowsTerminal_*__*'
+            PreviewPattern      = 'Microsoft.WindowsTerminalPreview_*__*'
+            StablePackageName   = 'Microsoft.WindowsTerminal_8wekyb3d8bbwe'
+            PreviewPackageName  = 'Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe'
+            Executable          = 'wt.exe'
+            MenuKey             = 'MenuTerminal'
+            DisplayName         = 'Windows Terminal'
+            IconBaseName        = 'wt'
+            ExcludeProfileGuids = @()
+        }
+    } else {
+        return @{
+            PackagePattern      = 'Microsoft.IntelligentTerminal_*__*'
+            PreviewPattern      = $null
+            StablePackageName   = 'Microsoft.IntelligentTerminal_8wekyb3d8bbwe'
+            PreviewPackageName  = $null
+            Executable          = 'wtai.exe'
+            MenuKey             = 'MenuIntelligentTerminal'
+            DisplayName         = '智能终端'
+            IconBaseName        = 'wtai'
+            # 智能终端把 AI 侧栏注册成了普通 Profile,但它不是 shell 会话,从右键启动没意义,固定 GUID 来自 defaults.json
+            ExcludeProfileGuids = @('{fd19208a-412b-4857-8a2d-9ca592b4b16e}')
+        }
+    }
+}
 
 function Generate-HelperScript(
         # The cache folder
         [Parameter(Mandatory=$true)]
         [string]$cache)
 {
-    $content = 
+    $content =
     "Set shell = WScript.CreateObject(`"Shell.Application`")
      executable = WSCript.Arguments(0)
      folder = WScript.Arguments(1)
@@ -36,8 +71,8 @@ function Generate-HelperScript(
 Function Get-Icon {
 
     [CmdletBinding()]
-    
-    Param ( 
+
+    Param (
         [Parameter(Mandatory=$True, Position=1, HelpMessage="Enter the location of the .EXE file")]
         [string]$File,
 
@@ -45,9 +80,9 @@ Function Get-Icon {
         [Parameter(Position=1, ValueFromPipelineByPropertyName=$true)]
         [string]$OutputFile
     )
-    
+
     [System.Reflection.Assembly]::LoadWithPartialName('System.Drawing')  | Out-Null
-    
+
     [System.Drawing.Icon]::ExtractAssociatedIcon($File).ToBitmap().Save($OutputFile)
 }
 
@@ -68,16 +103,16 @@ function ConvertTo-Icon
     [Parameter(Mandatory=$true, Position=0, ValueFromPipelineByPropertyName=$true)]
     [Alias('Fullname')]
     [string]$File,
-   
+
     # If provided, will output the icon to a location
     [Parameter(Position=1, ValueFromPipelineByPropertyName=$true)]
     [string]$OutputFile
     )
-    
+
     begin {
-        Add-Type -AssemblyName System.Drawing   
+        Add-Type -AssemblyName System.Drawing
     }
-    
+
     process {
         #region Load Icon
         $resolvedFile = $ExecutionContext.SessionState.Path.GetResolvedPSPathFromPSPath($file)
@@ -97,13 +132,13 @@ function ConvertTo-Icon
         }
         #endregion Icon Size bound check
 
-        #region Save Icon                     
+        #region Save Icon
         $memoryStream = New-Object System.IO.MemoryStream
         $newBitmap.Save($memoryStream, [System.Drawing.Imaging.ImageFormat]::Png)
 
         $resolvedOutputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($outputFile)
         $output = [IO.File]::Create("$resolvedOutputFile")
-        
+
         $iconWriter = New-Object System.IO.BinaryWriter($output)
         # 0-1 reserved, 0
         $iconWriter.Write([byte]0)
@@ -144,7 +179,7 @@ function ConvertTo-Icon
         $iconWriter.Write($memoryStream.ToArray());
 
         $iconWriter.Flush();
-        $output.Close()               
+        $output.Close()
         #endregion Save Icon
 
         #region Cleanup
@@ -157,15 +192,17 @@ function ConvertTo-Icon
 
 function GetProgramFilesFolder(
     [Parameter(Mandatory=$true)]
+    [hashtable]$meta,
+    [Parameter(Mandatory=$true)]
     [bool]$includePreview)
 {
     $root = "$Env:ProgramFiles\WindowsApps"
     $versionFolders = (Get-ChildItem $root | Where-Object {
-            if ($includePreview) {
-                $_.Name -like "Microsoft.WindowsTerminal_*__*" -or
-                $_.Name -like "Microsoft.WindowsTerminalPreview_*__*"
+            if ($includePreview -and $meta.PreviewPattern) {
+                $_.Name -like $meta.PackagePattern -or
+                $_.Name -like $meta.PreviewPattern
             } else {
-                $_.Name -like "Microsoft.WindowsTerminal_*__*"
+                $_.Name -like $meta.PackagePattern
             }
         })
     $foundVersion = $null
@@ -173,18 +210,19 @@ function GetProgramFilesFolder(
     foreach ($versionFolder in $versionFolders) {
         if ($versionFolder.Name -match "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+") {
             $version = [version]$Matches.0
-            Write-Host "Found Windows Terminal version $version."
+            Write-Host "Found $($meta.DisplayName) version $version."
             if ($null -eq $foundVersion -or $version -gt $foundVersion) {
                 $foundVersion = $version
                 $result = $versionFolder.FullName
             }
         } else {
-            Write-Warning "Found Windows Terminal unsupported version in $versionFolder."
+            Write-Warning "Found $($meta.DisplayName) unsupported version in $versionFolder."
         }
     }
 
     if ($null -eq $result) {
-        Write-Error "Failed to find Windows Terminal actual folder under $root. To install menu items for Windows Terminal Preview, run with ""-Prerelease"" switch Exit."
+        $hint = if ($meta.PreviewPattern) { 'To install menu items for Preview version, run with "-PreRelease" switch.' } else { '' }
+        Write-Error "Failed to find $($meta.DisplayName) actual folder under $root. $hint Exit."
         exit 1
     }
 
@@ -195,18 +233,21 @@ function GetProgramFilesFolder(
     return $result
 }
 
-function GetWindowsTerminalIcon(
+function GetTerminalIcon(
+    [Parameter(Mandatory=$true)]
+    [hashtable]$meta,
     [Parameter(Mandatory=$true)]
     [string]$folder,
     [Parameter(Mandatory=$true)]
     [string]$localCache)
 {
-    $icon = "$localCache\wt.ico"
+    $base = $meta.IconBaseName
+    $icon = "$localCache\$base.ico"
     $actual = $folder + "\WindowsTerminal.exe"
     if (Test-Path $actual) {
         # use app icon directly.
         Write-Host "Found actual executable $actual."
-        $temp = "$localCache\wt.png"
+        $temp = "$localCache\$base.png"
         Get-Icon -File $actual -OutputFile $temp
         ConvertTo-Icon -File $temp -OutputFile $icon
     } else {
@@ -220,15 +261,14 @@ function GetWindowsTerminalIcon(
 
 function GetActiveProfiles(
     [Parameter(Mandatory=$true)]
+    [hashtable]$meta,
+    [Parameter(Mandatory=$true)]
     [bool]$isPreview)
 {
-    if ($isPreview) {
-        $file = "$env:LocalAppData\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json"
-    } else {
-        $file = "$env:LocalAppData\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
-    }
+    $pkg = if ($isPreview -and $meta.PreviewPackageName) { $meta.PreviewPackageName } else { $meta.StablePackageName }
+    $file = "$env:LocalAppData\Packages\$pkg\LocalState\settings.json"
     if (-not (Test-Path $file)) {
-        Write-Error "Couldn't find profiles. Please run Windows Terminal at least once after installing it. Exit."
+        Write-Error "Couldn't find profiles for $($meta.DisplayName). Please run $($meta.DisplayName) at least once after installing it. Exit."
         exit 1
     }
 
@@ -236,15 +276,28 @@ function GetActiveProfiles(
     if ($settings.profiles.PSObject.Properties.name -match "list") {
         $list = $settings.profiles.list
     } else {
-        $list = $settings.profiles 
+        $list = $settings.profiles
     }
 
-    return $list | Where-Object { -not $_.hidden} | Where-Object { ($null -eq $_.source) -or -not ($settings.disabledProfileSources -contains $_.source) }
+    $excluded = @($meta.ExcludeProfileGuids) | ForEach-Object { $_.ToLowerInvariant() }
+    return $list `
+        | Where-Object { -not $_.hidden } `
+        | Where-Object { ($null -eq $_.source) -or -not ($settings.disabledProfileSources -contains $_.source) } `
+        | Where-Object {
+            if ($_.guid -and ($excluded -contains $_.guid.ToLowerInvariant())) {
+                Write-Host "Skip built-in profile '$($_.name)' ($($_.guid))."
+                $false
+            } else {
+                $true
+            }
+        }
 }
 
 function GetProfileIcon (
     [Parameter(Mandatory=$true)]
     $profile,
+    [Parameter(Mandatory=$true)]
+    [hashtable]$meta,
     [Parameter(Mandatory=$true)]
     [string]$folder,
     [Parameter(Mandatory=$true)]
@@ -259,24 +312,21 @@ function GetProfileIcon (
     $result = $null
     $profilePng = $null
     $icon = $profile.icon
+
+    $stablePkgPath = "$Env:LOCALAPPDATA\Packages\$($meta.StablePackageName)"
+    $previewPkgPath = if ($meta.PreviewPackageName) { "$Env:LOCALAPPDATA\Packages\$($meta.PreviewPackageName)" } else { $stablePkgPath }
+    $pkgPath = if ($isPreview -and $meta.PreviewPackageName) { $previewPkgPath } else { $stablePkgPath }
+
     if ($null -ne $icon) {
         if (Test-Path $icon) {
             # use user setting
-            $profilePng = $icon  
+            $profilePng = $icon
         } elseif ($profile.icon -like "ms-appdata:///Roaming/*") {
             #resolve roaming cache
-            if ($isPreview) {
-                $profilePng = $icon -replace "ms-appdata:///Roaming", "$Env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\RoamingState" -replace "/", "\"
-            } else {
-                $profilePng = $icon -replace "ms-appdata:///Roaming", "$Env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\RoamingState" -replace "/", "\"
-            }
+            $profilePng = $icon -replace "ms-appdata:///Roaming", "$pkgPath\RoamingState" -replace "/", "\"
         } elseif ($profile.icon -like "ms-appdata:///Local/*") {
             #resolve local cache
-            if ($isPreview) {
-                $profilePng = $icon -replace "ms-appdata:///Local", "$Env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState" -replace "/", "\"
-            } else {
-                $profilePng = $icon -replace "ms-appdata:///Local", "$Env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState" -replace "/", "\"
-            }
+            $profilePng = $icon -replace "ms-appdata:///Local", "$pkgPath\LocalState" -replace "/", "\"
         } elseif ($profile.icon -like "ms-appx:///*") {
             # resolve app cache
             $profilePng = $icon -replace "ms-appx://", $folder -replace "/", "\"
@@ -297,7 +347,7 @@ function GetProfileIcon (
         }
     }
 
-    if (Test-Path $profilePng) {        
+    if (Test-Path $profilePng) {
         if ($profilePng -like "*.png") {
             # found PNG, convert to ICO
             $result = "$localCache\$guid.ico"
@@ -347,6 +397,8 @@ function CreateProfileMenuItems(
     [Parameter(Mandatory=$true)]
     $profile,
     [Parameter(Mandatory=$true)]
+    [hashtable]$meta,
+    [Parameter(Mandatory=$true)]
     [string]$executable,
     [Parameter(Mandatory=$true)]
     [string]$folder,
@@ -363,22 +415,26 @@ function CreateProfileMenuItems(
     $name = $profile.name
     $command = """$executable"" -p ""$name"" -d ""%V."""
     $elevated = "wscript.exe ""$localCache/helper.vbs"" ""$executable"" ""%V."" ""$name"""
-    $profileIcon = GetProfileIcon $profile $folder $localCache $icon $isPreview
+    $profileIcon = GetProfileIcon $profile $meta $folder $localCache $icon $isPreview
+    $menuKey = $meta.MenuKey
+    $menuKeyAdmin = "${menuKey}Admin"
 
     if ($layout -eq "Default") {
-        $rootKey = "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\MenuTerminal\shell\$guid"
-        $rootKeyElevated = "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\MenuTerminalAdmin\shell\$guid"
+        $rootKey = "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\$menuKey\shell\$guid"
+        $rootKeyElevated = "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\$menuKeyAdmin\shell\$guid"
         CreateMenuItem $rootKey $name $profileIcon $command $false
         CreateMenuItem $rootKeyElevated $name $profileIcon $elevated $true
     } elseif ($layout -eq "Flat") {
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminal_$guid" "$name here" $profileIcon $command $false
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminalAdmin_$guid" "$name here as administrator" $profileIcon $elevated $true   
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminal_$guid" "$name here" $profileIcon $command $false
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminalAdmin_$guid" "$name here as administrator" $profileIcon $elevated $true   
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\${menuKey}_$guid" "$name here" $profileIcon $command $false
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\${menuKeyAdmin}_$guid" "$name here as administrator" $profileIcon $elevated $true
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\${menuKey}_$guid" "$name here" $profileIcon $command $false
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\${menuKeyAdmin}_$guid" "$name here as administrator" $profileIcon $elevated $true
     }
 }
 
 function CreateMenuItems(
+    [Parameter(Mandatory=$true)]
+    [hashtable]$meta,
     [Parameter(Mandatory=$true)]
     [string]$executable,
     [Parameter(Mandatory=$true)]
@@ -386,7 +442,7 @@ function CreateMenuItems(
     [Parameter(Mandatory=$true)]
     [bool]$includePreview)
 {
-    $folder = GetProgramFilesFolder $includePreview
+    $folder = GetProgramFilesFolder $meta $includePreview
     $localCache = "$Env:LOCALAPPDATA\Microsoft\WindowsApps\Cache"
 
     if (-not (Test-Path $localCache)) {
@@ -394,47 +450,59 @@ function CreateMenuItems(
     }
 
     Generate-HelperScript $localCache
-    $icon = GetWindowsTerminalIcon $folder $localCache
+    $icon = GetTerminalIcon $meta $folder $localCache
+
+    $menuKey = $meta.MenuKey
+    $menuKeyAdmin = "${menuKey}Admin"
+    $menuKeyMini = "${menuKey}Mini"
+    $menuKeyAdminMini = "${menuKey}AdminMini"
+    $displayName = $meta.DisplayName
+    $openText = "在此处打开 $displayName"
+    $openAdminText = "在此处以管理员身份打开 $displayName"
 
     if ($layout -eq "Default") {
-        # defaut layout creates two menus
-        New-Item -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminal' -Force | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminal' -Name 'MUIVerb' -PropertyType String -Value '在此处打开 Windows Terminal' | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminal' -Name 'Icon' -PropertyType String -Value $icon | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminal' -Name 'ExtendedSubCommandsKey' -PropertyType String -Value 'Directory\\ContextMenus\\MenuTerminal' | Out-Null
+        # default layout creates two menus
+        New-Item -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKey" -Force | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKey" -Name 'MUIVerb' -PropertyType String -Value $openText | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKey" -Name 'Icon' -PropertyType String -Value $icon | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKey" -Name 'ExtendedSubCommandsKey' -PropertyType String -Value "Directory\\ContextMenus\\$menuKey" | Out-Null
 
-        New-Item -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminal' -Force | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminal' -Name 'MUIVerb' -PropertyType String -Value '在此处打开 Windows Terminal' | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminal' -Name 'Icon' -PropertyType String -Value $icon | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminal' -Name 'ExtendedSubCommandsKey' -PropertyType String -Value 'Directory\\ContextMenus\\MenuTerminal' | Out-Null
+        New-Item -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKey" -Force | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKey" -Name 'MUIVerb' -PropertyType String -Value $openText | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKey" -Name 'Icon' -PropertyType String -Value $icon | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKey" -Name 'ExtendedSubCommandsKey' -PropertyType String -Value "Directory\\ContextMenus\\$menuKey" | Out-Null
 
-        New-Item -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\MenuTerminal\shell' -Force | Out-Null
+        New-Item -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\$menuKey\shell" -Force | Out-Null
 
-        New-Item -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminalAdmin' -Force | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminalAdmin' -Name 'MUIVerb' -PropertyType String -Value '在此处以管理员身份打开 Windows Terminal' | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminalAdmin' -Name 'Icon' -PropertyType String -Value $icon | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminalAdmin' -Name 'ExtendedSubCommandsKey' -PropertyType String -Value 'Directory\\ContextMenus\\MenuTerminalAdmin' | Out-Null
+        New-Item -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKeyAdmin" -Force | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKeyAdmin" -Name 'MUIVerb' -PropertyType String -Value $openAdminText | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKeyAdmin" -Name 'Icon' -PropertyType String -Value $icon | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKeyAdmin" -Name 'ExtendedSubCommandsKey' -PropertyType String -Value "Directory\\ContextMenus\\$menuKeyAdmin" | Out-Null
 
-        New-Item -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminalAdmin' -Force | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminalAdmin' -Name 'MUIVerb' -PropertyType String -Value '在此处以管理员身份打开 Windows Terminal' | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminalAdmin' -Name 'Icon' -PropertyType String -Value $icon | Out-Null
-        New-ItemProperty -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminalAdmin' -Name 'ExtendedSubCommandsKey' -PropertyType String -Value 'Directory\\ContextMenus\\MenuTerminalAdmin' | Out-Null
+        New-Item -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKeyAdmin" -Force | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKeyAdmin" -Name 'MUIVerb' -PropertyType String -Value $openAdminText | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKeyAdmin" -Name 'Icon' -PropertyType String -Value $icon | Out-Null
+        New-ItemProperty -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKeyAdmin" -Name 'ExtendedSubCommandsKey' -PropertyType String -Value "Directory\\ContextMenus\\$menuKeyAdmin" | Out-Null
 
-        New-Item -Path 'Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\MenuTerminalAdmin\shell' -Force | Out-Null
+        New-Item -Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\ContextMenus\$menuKeyAdmin\shell" -Force | Out-Null
     } elseif ($layout -eq "Mini") {
         $command = """$executable"" -d ""%V."""
         $elevated = "wscript.exe ""$localCache/helper.vbs"" ""$executable"" ""%V."""
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminalMini" "在此处打开 Windows Terminal" $icon $command $false
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminalAdminMini" "在此处以管理员身份打开 Windows Terminal" $icon $elevated $true   
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminalMini" "在此处打开 Windows Terminal" $icon $command $false
-        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\MenuTerminalAdminMini" "在此处以管理员身份打开 Windows Terminal" $icon $elevated $true   
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKeyMini" $openText $icon $command $false
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$menuKeyAdminMini" $openAdminText $icon $elevated $true
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKeyMini" $openText $icon $command $false
+        CreateMenuItem "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\Background\shell\$menuKeyAdminMini" $openAdminText $icon $elevated $true
         return
     }
 
-    $isPreview = $folder -like "*WindowsTerminalPreview*"
-    $profiles = GetActiveProfiles $isPreview
+    $isPreview = $false
+    if ($meta.PreviewPattern) {
+        $folderName = Split-Path $folder -Leaf
+        $isPreview = $folderName -like $meta.PreviewPattern
+    }
+    $profiles = GetActiveProfiles $meta $isPreview
     foreach ($profile in $profiles) {
-        CreateProfileMenuItems $profile $executable $folder $localCache $icon $layout $isPreview
+        CreateProfileMenuItems $profile $meta $executable $folder $localCache $icon $layout $isPreview
     }
 }
 
@@ -445,10 +513,14 @@ if ((Get-Process -Id $pid).Path -like "*WindowsApps*") {
     exit 1
 }
 
-if ((Test-Path "Registry::HKEY_CLASSES_ROOT\Directory\shell\MenuTerminal") -and
-    -not (Test-Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\MenuTerminal")) {
-    Write-Error "Please execute uninstall.old.ps1 to remove previous installation."
-    exit 1
+$meta = Get-EditionMeta -Edition $Edition
+
+if ($Edition -eq 'simple') {
+    if ((Test-Path "Registry::HKEY_CLASSES_ROOT\Directory\shell\$($meta.MenuKey)") -and
+        -not (Test-Path "Registry::HKEY_CURRENT_USER\SOFTWARE\Classes\Directory\shell\$($meta.MenuKey)")) {
+        Write-Error "Please execute uninstall.old.ps1 to remove previous installation."
+        exit 1
+    }
 }
 
 if ($PSVersionTable.PSVersion.Major -lt 6) {
@@ -456,14 +528,18 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     exit 1
 }
 
-$executable = "$Env:LOCALAPPDATA\Microsoft\WindowsApps\wt.exe"
+if ($PreRelease -and -not $meta.PreviewPattern) {
+    Write-Warning "$($meta.DisplayName) has no Preview channel; -PreRelease will be ignored."
+}
+
+$executable = "$Env:LOCALAPPDATA\Microsoft\WindowsApps\$($meta.Executable)"
 if (-not (Test-Path $executable)) {
-    Write-Error "Windows Terminal not detected at $executable. Learn how to install it from https://github.com/microsoft/terminal (via Microsoft Store is recommended). Exit."
+    Write-Error "$($meta.DisplayName) not detected at $executable. Make sure $($meta.DisplayName) is installed. Exit."
     exit 1
 }
 
-Write-Host "Use $Layout layout."
+Write-Host "Edition: $($meta.DisplayName). Layout: $Layout."
 
-CreateMenuItems $executable $Layout $PreRelease
+CreateMenuItems $meta $executable $Layout $PreRelease
 
-Write-Host "Windows Terminal installed to Windows Explorer context menu."
+Write-Host "$($meta.DisplayName) installed to Windows Explorer context menu."
